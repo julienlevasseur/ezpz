@@ -7,7 +7,7 @@ use faer::{
     sparse::SparseColMatRef,
 };
 
-use crate::{FreedomAnalysis, NonLinearSystemError, solver::Model};
+use crate::{ConstraintEntry, FreedomAnalysis, NonLinearSystemError, solver::Model};
 
 const TOLERANCE_BASE: f64 = 1E-8;
 
@@ -25,8 +25,85 @@ impl Model<'_> {
 
         let nullspace = orthonormal_nullspace(j_dense.as_mat_ref(), nvars)?;
         let underconstrained = underconstrained_variables(nullspace.as_mat_ref(), nvars);
-        Ok(FreedomAnalysis::new(underconstrained))
+
+        let mut redundant = Vec::new();
+        let rank = redundant_constraints(j_dense.as_mat_ref(), self.constraints, &mut redundant)?;
+        Ok(FreedomAnalysis::new(
+            underconstrained,
+            redundant,
+            rank,
+            j_dense.nrows(),
+        ))
     }
+}
+
+/// How much of a constraint's rows must lie in the left null space for it to count as
+/// taking part in a dependency. Entries of an orthonormal null-space basis are O(1) on
+/// the rows of a genuine dependency, and at the level of the solver's final error on the
+/// rest, so anything between the two separates them.
+const PARTICIPATION_TOLERANCE: f64 = 1E-6;
+
+/// Finds the constraints which could each be removed without lowering the rank of the
+/// Jacobian, i.e. without freeing anything, and pushes their ids onto `redundant`.
+/// Returns the rank of the Jacobian.
+///
+/// With N an orthonormal basis of the left null space of J (the dependencies between
+/// its rows), removing a constraint's rows R leaves the rank at
+/// `rank(J) - |R| + rank(N[R, :])`. So a constraint is redundant exactly when its block
+/// of N has full row rank. For a one-row constraint, that is "the row appears in some
+/// dependency". A multi-row constraint can take part in a dependency and still not be
+/// redundant: `PointsCoincident` whose x is implied by the rest but whose y is not.
+fn redundant_constraints(
+    jacobian: MatRef<'_, f64>,
+    constraints: &[ConstraintEntry<'_>],
+    redundant: &mut Vec<usize>,
+) -> Result<usize, NonLinearSystemError> {
+    let (neqs, nvars) = (jacobian.nrows(), jacobian.ncols());
+
+    // Which rows depend on which doesn't change with their scale, but the SVD's
+    // tolerance does: a weighted constraint, or one in radians next to ones in
+    // millimetres, would otherwise dominate it. A zero row stays zero, and is its own
+    // dependency. Not EPSILON: a small gradient is still a direction (an angle between
+    // long lines has one of about 1/length), and dividing by it is harmless.
+    let mut rows = jacobian.to_owned();
+    for row in rows.row_iter_mut() {
+        let norm = row.norm_l2();
+        if norm > 0.0 {
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    let svd = rows.svd().map_err(NonLinearSystemError::FaerSvd)?;
+    let singular = svd.S().column_vector();
+    let largest = singular.iter().copied().fold(0.0, libm::fmax);
+    let tolerance = TOLERANCE_BASE * largest;
+    let rank = singular.iter().filter(|&&s| s > tolerance).count();
+    let nullity = neqs - rank;
+    debug_assert!(rank <= nvars);
+    if nullity == 0 {
+        return Ok(rank);
+    }
+    // U is neqs x neqs, and its columns past the rank span the left null space.
+    let left_null = svd.U().subcols(rank, nullity);
+
+    let mut row = 0;
+    for constraint in constraints {
+        let dim = constraint.constraint.residual_dim();
+        let block = left_null.subrows(row, dim);
+        row += dim;
+        let block_rank = block
+            .singular_values()
+            .map_err(NonLinearSystemError::FaerSvd)?
+            .iter()
+            .filter(|&&s| s > PARTICIPATION_TOLERANCE)
+            .count();
+        if block_rank == dim {
+            redundant.push(constraint.id);
+        }
+    }
+    Ok(rank)
 }
 
 fn orthonormal_nullspace(
