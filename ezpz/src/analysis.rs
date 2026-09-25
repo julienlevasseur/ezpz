@@ -29,6 +29,13 @@ pub struct FreedomAnalysis {
     /// add more constraints so that their positions are properly specified and don't
     /// depend on the initial guesses.
     underconstrained: Vec<crate::Id>,
+    /// Constraints which could each be removed without freeing anything,
+    /// identified by their index in the request list.
+    redundant: Vec<usize>,
+    /// Rank of the Jacobian at the final solution.
+    rank: usize,
+    /// Number of equations (Jacobian rows) in the system.
+    num_equations: usize,
 }
 
 impl Analysis for FreedomAnalysis {
@@ -38,15 +45,23 @@ impl Analysis for FreedomAnalysis {
 
     #[mutants::skip]
     fn no_constraints() -> Self {
-        Self {
-            underconstrained: Vec::new(),
-        }
+        Self::default()
     }
 }
 
 impl FreedomAnalysis {
-    pub(crate) fn new(underconstrained: Vec<crate::Id>) -> Self {
-        Self { underconstrained }
+    pub(crate) fn new(
+        underconstrained: Vec<crate::Id>,
+        redundant: Vec<usize>,
+        rank: usize,
+        num_equations: usize,
+    ) -> Self {
+        Self {
+            underconstrained,
+            redundant,
+            rank,
+            num_equations,
+        }
     }
 
     /// Is any variable in the system underconstrained?
@@ -64,6 +79,37 @@ impl FreedomAnalysis {
     /// Just like [`FreedomAnalysis::underconstrained`] except it consumes the struct to take ownership.
     pub fn into_underconstrained(self) -> Vec<crate::Id> {
         self.underconstrained
+    }
+
+    /// Could any constraint be removed without freeing anything?
+    pub fn has_redundant_constraints(&self) -> bool {
+        !self.redundant.is_empty()
+    }
+
+    /// Constraints which could each be removed without freeing anything, because at
+    /// the final solution what they say is implied by the other constraints. Removing
+    /// any one of them is safe; removing several at once may not be. Each is the
+    /// constraint's index in the request list, the same numbering as
+    /// [`crate::SolveOutcome::unsatisfied`], in request order.
+    ///
+    /// A constraint with several equations is listed only if all of them are implied
+    /// by the others, so [`Self::rank`] can be below [`Self::num_equations`] with
+    /// nothing listed here. If the system is unsatisfied, a constraint listed here may
+    /// be in conflict with the others rather than merely repeating them.
+    pub fn redundant(&self) -> &[usize] {
+        &self.redundant
+    }
+
+    /// Rank of the Jacobian at the final solution: how many of the system's
+    /// equations are independent.
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// Number of equations in the system. Most constraints contribute one;
+    /// some, like [`crate::Constraint::PointsCoincident`], contribute more.
+    pub fn num_equations(&self) -> usize {
+        self.num_equations
     }
 }
 
